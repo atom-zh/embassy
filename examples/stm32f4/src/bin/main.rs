@@ -8,6 +8,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[path = "app/usart.rs"]
 mod usart;
+#[path = "app/gpio.rs"]
+mod gpio;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -22,10 +24,21 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     let start = Instant::now();
 
+    let usart_pins = gpio::gpio_init(&spawner, p);
+
     // USART setup + task spawning lives in the USART module.
     // UART1: USART1 PA10(RX), PA9(TX)
     // UART3: USART3 PD9(RX), PD8(TX)
-    usart::init(&spawner, p.USART1, p.PA10, p.PA9, p.USART3, p.PD9, p.PD8, start);
+    usart::init(
+        &spawner,
+        usart_pins.uart1,
+        usart_pins.uart1_rx,
+        usart_pins.uart1_tx,
+        usart_pins.uart3,
+        usart_pins.uart3_rx,
+        usart_pins.uart3_tx,
+        start,
+    );
 
     loop {
         Timer::after_secs(60).await;
