@@ -945,6 +945,26 @@ pub(crate) unsafe fn init(_cs: CriticalSection) {
     #[cfg(afio)]
     crate::rcc::enable_and_reset_with_cs::<crate::peripherals::AFIO>(_cs);
 
+    // Workaround: some device descriptions for STM32F427VG include GPIOJ/K in the
+    // generated `init_gpio()`, which can BusFault on packages where those GPIO ports
+    // are not implemented.
+    //
+    // We only need clocks for GPIO ports to be able to configure pins later; setting
+    // all pins to analog is an optional low-power default.
+    #[cfg(feature = "stm32f427vg")]
+    {
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpioaen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpioben(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpiocen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpioden(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpioeen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpiofen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpiogen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpiohen(true));
+        crate::pac::RCC.ahb1enr().modify(|w| w.set_gpioien(true));
+    }
+
+    #[cfg(not(feature = "stm32f427vg"))]
     crate::_generated::init_gpio();
 }
 
