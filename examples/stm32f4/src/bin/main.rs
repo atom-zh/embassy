@@ -3,9 +3,7 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{BufferedUart, Config};
 use embassy_time::{Instant, Timer};
-use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 #[path = "app/usart.rs"]
@@ -22,25 +20,10 @@ async fn main(spawner: Spawner) {
     info!("DBGMCU_IDCODE: 0x{:08x}", dbg_idcode);
 
     let p = embassy_stm32::init(Default::default());
-
-    let mut config = Config::default();
-    config.baudrate = 115200;
-
-    static TX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
-    static RX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
-
-    let tx_buf = TX_BUF_CELL.init([0u8; 256]);
-    let rx_buf = RX_BUF_CELL.init([0u8; 256]);
-
-    let usart = BufferedUart::new(p.USART1, p.PA10, p.PA9, tx_buf, rx_buf, usart::Irqs, config).unwrap();
     let start = Instant::now();
 
-    // Split TX/RX so the shell can block on RX without starving the periodic writers.
-    let (tx, rx) = usart.split();
-    let (usart_tx, usart_rx) = usart::init_uart_mutexes(tx, rx);
-
-    // Spawn application tasks (including shell).
-    usart::init(&spawner, usart_tx, usart_rx, start);
+    // USART setup + task spawning lives in the USART module.
+    usart::init(&spawner, p.USART1, p.PA10, p.PA9, start);
 
     loop {
         Timer::after_secs(60).await;
