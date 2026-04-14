@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUartRx, BufferedUartTx};
-use embassy_stm32::{bind_interrupts, peripherals};
+use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config};
+use embassy_stm32::{bind_interrupts, peripherals, Peri};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
@@ -22,6 +22,9 @@ pub type UsartRx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
 static USART_TX: StaticCell<UsartTx> = StaticCell::new();
 static USART_RX: StaticCell<UsartRx> = StaticCell::new();
 
+static TX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
+static RX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
+
 static TASK_A_COUNT: AtomicU32 = AtomicU32::new(0);
 static TASK_A_LAST_SECS: AtomicU32 = AtomicU32::new(0);
 static TASK_B_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -29,7 +32,7 @@ static TASK_B_LAST_SECS: AtomicU32 = AtomicU32::new(0);
 static SHELL_COUNT: AtomicU32 = AtomicU32::new(0);
 static SHELL_LAST_SECS: AtomicU32 = AtomicU32::new(0);
 
-pub fn init_uart_mutexes(
+fn init_uart_mutexes(
     tx: BufferedUartTx<'static>,
     rx: BufferedUartRx<'static>,
 ) -> (&'static UsartTx, &'static UsartRx) {
@@ -39,7 +42,23 @@ pub fn init_uart_mutexes(
 }
 
 /// Initialize the USART application tasks.
-pub fn init(spawner: &Spawner, usart_tx: &'static UsartTx, usart_rx: &'static UsartRx, start: Instant) {
+pub fn init(
+    spawner: &Spawner,
+    usart: Peri<'static, peripherals::USART1>,
+    rx: Peri<'static, peripherals::PA10>,
+    tx: Peri<'static, peripherals::PA9>,
+    start: Instant,
+) {
+    let mut config = Config::default();
+    config.baudrate = 115200;
+
+    let tx_buf = TX_BUF_CELL.init([0u8; 256]);
+    let rx_buf = RX_BUF_CELL.init([0u8; 256]);
+
+    let usart = BufferedUart::new(usart, rx, tx, tx_buf, rx_buf, Irqs, config).unwrap();
+    let (tx, rx) = usart.split();
+    let (usart_tx, usart_rx) = init_uart_mutexes(tx, rx);
+
     spawner.spawn(usart_task_a(usart_tx, start).unwrap());
     spawner.spawn(usart_task_b(usart_tx, start).unwrap());
     spawner.spawn(shell_task(usart_tx, usart_rx, start).unwrap());
