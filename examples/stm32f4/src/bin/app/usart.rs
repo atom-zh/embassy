@@ -1,71 +1,153 @@
 use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::convert::Infallible;
 
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config};
 use embassy_stm32::{bind_interrupts, peripherals, Peri};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
-use embedded_io_async::{Read as IoRead, Write as IoWrite};
+use embedded_io_async::{ErrorType, Read as IoRead, Write as IoWrite};
 use heapless::String;
 use static_cell::StaticCell;
 
-bind_interrupts!(pub struct Irqs {
+bind_interrupts!(pub struct Uart1Irqs {
     USART1 => BufferedInterruptHandler<peripherals::USART1>;
 });
 
-pub type UsartTx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
-pub type UsartRx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
+bind_interrupts!(pub struct Uart3Irqs {
+    USART3 => BufferedInterruptHandler<peripherals::USART3>;
+});
 
-static USART_TX: StaticCell<UsartTx> = StaticCell::new();
-static USART_RX: StaticCell<UsartRx> = StaticCell::new();
+// UART1 is the existing console UART (USART1, PA9/PA10)
+pub type Uart1Tx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
+pub type Uart1Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
+
+// UART3 is the new high-speed passthrough UART (USART3, PD8/PD9)
+pub type Uart3Tx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
+pub type Uart3Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
+
+pub struct ShellChannelRx;
+
+impl ErrorType for ShellChannelRx {
+    type Error = Infallible;
+}
+
+impl IoRead for ShellChannelRx {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Block until at least one byte is available.
+        buf[0] = UART1_SHELL_CH.receive().await;
+        let mut n = 1;
+
+        // Drain any additional bytes that are already queued.
+        while n < buf.len() {
+            match UART1_SHELL_CH.try_receive() {
+                Ok(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+pub type Uart1ShellRx = Mutex<NoopRawMutex, ShellChannelRx>;
+
+static UART1_TX: StaticCell<Uart1Tx> = StaticCell::new();
+static UART1_RX: StaticCell<Uart1Rx> = StaticCell::new();
+
+static UART3_TX: StaticCell<Uart3Tx> = StaticCell::new();
+static UART3_RX: StaticCell<Uart3Rx> = StaticCell::new();
+
+static UART1_SHELL_RX: StaticCell<Uart1ShellRx> = StaticCell::new();
+static UART1_SHELL_CH: Channel<ThreadModeRawMutex, u8, 256> = Channel::new();
 
 static TX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
 static RX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
 
+static UART3_TX_BUF_CELL: StaticCell<[u8; 512]> = StaticCell::new();
+static UART3_RX_BUF_CELL: StaticCell<[u8; 512]> = StaticCell::new();
+
+#[allow(dead_code)]
 static TASK_A_COUNT: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static TASK_A_LAST_SECS: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static TASK_B_COUNT: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static TASK_B_LAST_SECS: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static SHELL_COUNT: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static SHELL_LAST_SECS: AtomicU32 = AtomicU32::new(0);
 
-fn init_uart_mutexes(
-    tx: BufferedUartTx<'static>,
-    rx: BufferedUartRx<'static>,
-) -> (&'static UsartTx, &'static UsartRx) {
-    let usart_tx = USART_TX.init(Mutex::new(tx));
-    let usart_rx = USART_RX.init(Mutex::new(rx));
-    (usart_tx, usart_rx)
+fn init_uart1_mutexes(tx: BufferedUartTx<'static>, rx: BufferedUartRx<'static>) -> (&'static Uart1Tx, &'static Uart1Rx) {
+    let uart1_tx = UART1_TX.init(Mutex::new(tx));
+    let uart1_rx = UART1_RX.init(Mutex::new(rx));
+    (uart1_tx, uart1_rx)
+}
+
+fn init_uart3_mutexes(tx: BufferedUartTx<'static>, rx: BufferedUartRx<'static>) -> (&'static Uart3Tx, &'static Uart3Rx) {
+    let uart3_tx = UART3_TX.init(Mutex::new(tx));
+    let uart3_rx = UART3_RX.init(Mutex::new(rx));
+    (uart3_tx, uart3_rx)
 }
 
 /// Initialize the USART application tasks.
 pub fn init(
     spawner: &Spawner,
-    usart: Peri<'static, peripherals::USART1>,
-    rx: Peri<'static, peripherals::PA10>,
-    tx: Peri<'static, peripherals::PA9>,
+    uart1: Peri<'static, peripherals::USART1>,
+    uart1_rx: Peri<'static, peripherals::PA10>,
+    uart1_tx: Peri<'static, peripherals::PA9>,
+    uart3: Peri<'static, peripherals::USART3>,
+    uart3_rx: Peri<'static, peripherals::PD9>,
+    uart3_tx: Peri<'static, peripherals::PD8>,
     start: Instant,
 ) {
-    let mut config = Config::default();
-    config.baudrate = 115200;
+    // UART1 (console)
+    let mut uart1_cfg = Config::default();
+    uart1_cfg.baudrate = 115200;
+    let uart1_tx_buf = TX_BUF_CELL.init([0u8; 256]);
+    let uart1_rx_buf = RX_BUF_CELL.init([0u8; 256]);
+    let uart1 = BufferedUart::new(uart1, uart1_rx, uart1_tx, uart1_tx_buf, uart1_rx_buf, Uart1Irqs, uart1_cfg).unwrap();
+    let (uart1_tx, uart1_rx) = uart1.split();
+    let (uart1_tx, uart1_rx) = init_uart1_mutexes(uart1_tx, uart1_rx);
 
-    let tx_buf = TX_BUF_CELL.init([0u8; 256]);
-    let rx_buf = RX_BUF_CELL.init([0u8; 256]);
+    // UART3 (passthrough)
+    let mut uart3_cfg = Config::default();
+    uart3_cfg.baudrate = 921_600;
+    let uart3_tx_buf = UART3_TX_BUF_CELL.init([0u8; 512]);
+    let uart3_rx_buf = UART3_RX_BUF_CELL.init([0u8; 512]);
+    let uart3 = BufferedUart::new(uart3, uart3_rx, uart3_tx, uart3_tx_buf, uart3_rx_buf, Uart3Irqs, uart3_cfg).unwrap();
+    let (uart3_tx, uart3_rx) = uart3.split();
+    let (uart3_tx, uart3_rx) = init_uart3_mutexes(uart3_tx, uart3_rx);
 
-    let usart = BufferedUart::new(usart, rx, tx, tx_buf, rx_buf, Irqs, config).unwrap();
-    let (tx, rx) = usart.split();
-    let (usart_tx, usart_rx) = init_uart_mutexes(tx, rx);
+    let uart1_shell_rx = UART1_SHELL_RX.init(Mutex::new(ShellChannelRx));
 
-    spawner.spawn(usart_task_a(usart_tx, start).unwrap());
-    spawner.spawn(usart_task_b(usart_tx, start).unwrap());
-    spawner.spawn(shell_task(usart_tx, usart_rx, start).unwrap());
+    // Existing tasks temporarily disabled.
+    let _ = uart1_shell_rx;
+    let _ = start;
+    // spawner.spawn(usart_task_a(uart1_tx, start).unwrap());
+    // spawner.spawn(usart_task_b(uart1_tx, start).unwrap());
+    // spawner.spawn(shell_task(uart1_tx, uart1_shell_rx, start).unwrap());
+
+    // Passthrough tasks (independent tasks)
+    spawner.spawn(uart1_to_uart3_passthrough(uart1_rx, uart1_tx, uart3_tx).unwrap());
+    spawner.spawn(uart3_to_uart1_passthrough(uart3_rx, uart1_tx).unwrap());
 }
 
 #[embassy_executor::task]
-async fn usart_task_a(usart_tx: &'static UsartTx, start: Instant) {
+async fn usart_task_a(usart_tx: &'static Uart1Tx, start: Instant) {
     loop {
         let mut guard = usart_tx.lock().await;
         unwrap!(IoWrite::write(&mut *guard, b"[Task A] Hello from task A!\r\n").await);
@@ -78,7 +160,7 @@ async fn usart_task_a(usart_tx: &'static UsartTx, start: Instant) {
 }
 
 #[embassy_executor::task]
-async fn usart_task_b(usart_tx: &'static UsartTx, start: Instant) {
+async fn usart_task_b(usart_tx: &'static Uart1Tx, start: Instant) {
     loop {
         let mut guard = usart_tx.lock().await;
         unwrap!(IoWrite::write(&mut *guard, b"[Task B] Hello from task B!\r\n").await);
@@ -91,7 +173,7 @@ async fn usart_task_b(usart_tx: &'static UsartTx, start: Instant) {
 }
 
 #[embassy_executor::task]
-pub async fn shell_task(usart_tx: &'static UsartTx, usart_rx: &'static UsartRx, start: Instant) {
+pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1ShellRx, start: Instant) {
     let mut line_buf = [0u8; 128];
     let mut line_len: usize = 0;
     let mut last_was_cr = false;
@@ -219,6 +301,70 @@ pub async fn shell_task(usart_tx: &'static UsartTx, usart_rx: &'static UsartRx, 
                 }
             }
         }
+        drop(guard);
+    }
+}
+
+#[embassy_executor::task]
+async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart1_tx: &'static Uart1Tx, uart3_tx: &'static Uart3Tx) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = {
+            let mut guard = uart1_rx.lock().await;
+            match IoRead::read(&mut *guard, &mut buf).await {
+                Ok(n) => n,
+                Err(_) => {
+                    Timer::after_millis(1).await;
+                    continue;
+                }
+            }
+        };
+
+        if n == 0 {
+            Timer::after_millis(1).await;
+            continue;
+        }
+
+        // Feed shell (best-effort, drop if full)
+        for &b in &buf[..n] {
+            let _ = UART1_SHELL_CH.try_send(b);
+        }
+
+        // Echo back to UART1
+        {
+            let mut guard = uart1_tx.lock().await;
+            let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
+        }
+
+        // Forward to UART3
+        let mut guard = uart3_tx.lock().await;
+        let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
+        drop(guard);
+    }
+}
+
+#[embassy_executor::task]
+async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx, uart1_tx: &'static Uart1Tx) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = {
+            let mut guard = uart3_rx.lock().await;
+            match IoRead::read(&mut *guard, &mut buf).await {
+                Ok(n) => n,
+                Err(_) => {
+                    Timer::after_millis(1).await;
+                    continue;
+                }
+            }
+        };
+
+        if n == 0 {
+            Timer::after_millis(1).await;
+            continue;
+        }
+
+        let mut guard = uart1_tx.lock().await;
+        let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
         drop(guard);
     }
 }

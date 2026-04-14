@@ -23,7 +23,9 @@ async fn main(spawner: Spawner) {
     let start = Instant::now();
 
     // USART setup + task spawning lives in the USART module.
-    usart::init(&spawner, p.USART1, p.PA10, p.PA9, start);
+    // UART1: USART1 PA10(RX), PA9(TX)
+    // UART3: USART3 PD9(RX), PD8(TX)
+    usart::init(&spawner, p.USART1, p.PA10, p.PA9, p.USART3, p.PD9, p.PD8, start);
 
     loop {
         Timer::after_secs(60).await;
