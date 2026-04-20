@@ -3,9 +3,13 @@ use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::Timer;
 
-const HIGH_MILLIS: u64 = 200;
-const LOW_MILLIS: u64 = 200;
-const PD15_KEEPALIVE_MILLIS: u64 = 1000;
+const HIGH_MILLIS: u64 = 1000;
+const LOW_MILLIS: u64 = 1000;
+
+struct GpioTaskPins {
+    pe9: Output<'static>,
+    pd13: Output<'static>,
+}
 
 pub struct UsartPins {
     pub uart1: Peri<'static, peripherals::USART1>,
@@ -17,11 +21,9 @@ pub struct UsartPins {
 }
 
 pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins {
-    // GPIO configuration lives here (no PE9 argument required from main).
-    // Fixed pin: PE9
     let embassy_stm32::Peripherals {
         PE9,
-        PD15,
+        PD13,
         USART1,
         PA10,
         PA9,
@@ -32,15 +34,9 @@ pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins 
     } = p;
 
     let pe9 = Output::new(PE9, Level::High, Speed::Low);
-    spawner.spawn(blink_1hz(pe9).unwrap());
-
-    // Fixed pin: PD15, output mode, default high.
-    // Keep ownership in a task so lifecycle matches PE9 task style.
-    let mut pd15 = Output::new(PD15, Level::High, Speed::Low);
-    // spawner.spawn(hold_high(pd15).unwrap());
-    pd15.set_high();
-    Timer::after_millis(1000);
-    pd15.set_low();
+    let pd13 = Output::new(PD13, Level::Low, Speed::Low);
+    let gpio_pins = GpioTaskPins { pe9, pd13 };
+    spawner.spawn(gpio_task(gpio_pins).unwrap());
 
     UsartPins {
         uart1: USART1,
@@ -53,11 +49,16 @@ pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins 
 }
 
 #[embassy_executor::task]
-async fn blink_1hz(mut pin: Output<'static>) {
+async fn gpio_task(mut pins: GpioTaskPins) {
+    // Keep PE9 blinking at 1Hz and pulse PD13 high for the first second only.
+    pins.pd13.set_high();
+    Timer::after_millis(HIGH_MILLIS).await;
+    pins.pd13.set_low();
+
     loop {
-        pin.set_high();
-        Timer::after_millis(HIGH_MILLIS).await;
-        pin.set_low();
+        pins.pe9.set_low();
         Timer::after_millis(LOW_MILLIS).await;
+        pins.pe9.set_high();
+        Timer::after_millis(HIGH_MILLIS).await;
     }
 }
