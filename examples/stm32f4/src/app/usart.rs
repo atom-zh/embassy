@@ -1,6 +1,6 @@
+use core::convert::Infallible;
 use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicU32, Ordering};
-use core::convert::Infallible;
 
 use defmt::*;
 use embassy_executor::Spawner;
