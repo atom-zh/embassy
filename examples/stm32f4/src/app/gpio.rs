@@ -3,8 +3,8 @@ use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::{peripherals, Peri};
 use embassy_time::Timer;
 
-const HIGH_SECS: u64 = 1;
-const LOW_SECS: u64 = 1;
+const HIGH_MILLIS: u64 = 200;
+const LOW_MILLIS: u64 = 200;
 
 pub struct UsartPins {
     pub uart1: Peri<'static, peripherals::USART1>,
@@ -46,8 +46,8 @@ pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins 
 async fn blink_1hz(mut pin: Output<'static>) {
     loop {
         pin.set_high();
-        Timer::after_secs(HIGH_SECS).await;
+        Timer::after_millis(HIGH_MILLIS).await;
         pin.set_low();
-        Timer::after_secs(LOW_SECS).await;
+        Timer::after_millis(LOW_MILLIS).await;
     }
 }
