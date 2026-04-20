@@ -30,6 +30,9 @@ pub type Uart1Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
 pub type Uart3Tx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
 pub type Uart3Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
 
+const UART1_BAUDRATE: u32 = 921_600;
+const UART3_BAUDRATE: u32 = 921_600;
+
 pub struct ShellChannelRx;
 
 impl ErrorType for ShellChannelRx {
@@ -71,6 +74,7 @@ static UART3_RX: StaticCell<Uart3Rx> = StaticCell::new();
 
 static UART1_SHELL_RX: StaticCell<Uart1ShellRx> = StaticCell::new();
 static UART1_SHELL_CH: Channel<ThreadModeRawMutex, u8, 256> = Channel::new();
+static UART1_TX_CH: Channel<ThreadModeRawMutex, u8, 512> = Channel::new();
 
 static TX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
 static RX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
@@ -90,6 +94,19 @@ static TASK_B_LAST_SECS: AtomicU32 = AtomicU32::new(0);
 static SHELL_COUNT: AtomicU32 = AtomicU32::new(0);
 #[allow(dead_code)]
 static SHELL_LAST_SECS: AtomicU32 = AtomicU32::new(0);
+
+#[inline(never)]
+fn debug_after_read_marker(n: usize) {
+    // Another stable marker after UART read; good breakpoint target.
+    cortex_m::asm::nop();
+    core::hint::black_box(n);
+}
+
+async fn uart1_enqueue_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        UART1_TX_CH.send(b).await;
+    }
+}
 
 fn init_uart1_mutexes(tx: BufferedUartTx<'static>, rx: BufferedUartRx<'static>) -> (&'static Uart1Tx, &'static Uart1Rx) {
     let uart1_tx = UART1_TX.init(Mutex::new(tx));
@@ -116,7 +133,10 @@ pub fn init(
 ) {
     // UART1 (console)
     let mut uart1_cfg = Config::default();
-    uart1_cfg.baudrate = 115200;
+    // Lower console baudrate to avoid RX overrun during heavy load/debug sessions.
+    uart1_cfg.baudrate = UART1_BAUDRATE;
+    // Wake reader as soon as data arrives (instead of waiting for half buffer/idle).
+    uart1_cfg.eager_reads = Some(1);
     let uart1_tx_buf = TX_BUF_CELL.init([0u8; 256]);
     let uart1_rx_buf = RX_BUF_CELL.init([0u8; 256]);
     let uart1 = BufferedUart::new(uart1, uart1_rx, uart1_tx, uart1_tx_buf, uart1_rx_buf, Uart1Irqs, uart1_cfg).unwrap();
@@ -125,7 +145,8 @@ pub fn init(
 
     // UART3 (passthrough)
     let mut uart3_cfg = Config::default();
-    uart3_cfg.baudrate = 921_600;
+    uart3_cfg.baudrate = UART3_BAUDRATE;
+    uart3_cfg.eager_reads = Some(1);
     let uart3_tx_buf = UART3_TX_BUF_CELL.init([0u8; 512]);
     let uart3_rx_buf = UART3_RX_BUF_CELL.init([0u8; 512]);
     let uart3 = BufferedUart::new(uart3, uart3_rx, uart3_tx, uart3_tx_buf, uart3_rx_buf, Uart3Irqs, uart3_cfg).unwrap();
@@ -142,8 +163,9 @@ pub fn init(
     // spawner.spawn(shell_task(uart1_tx, uart1_shell_rx, start).unwrap());
 
     // Passthrough tasks (independent tasks)
-    spawner.spawn(uart1_to_uart3_passthrough(uart1_rx, uart1_tx, uart3_tx).unwrap());
-    spawner.spawn(uart3_to_uart1_passthrough(uart3_rx, uart1_tx).unwrap());
+    spawner.spawn(uart1_tx_worker(uart1_tx).unwrap());
+    spawner.spawn(uart1_to_uart3_passthrough(uart1_rx, uart3_tx).unwrap());
+    spawner.spawn(uart3_to_uart1_passthrough(uart3_rx).unwrap());
 }
 
 #[embassy_executor::task]
@@ -306,7 +328,7 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
 }
 
 #[embassy_executor::task]
-async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart1_tx: &'static Uart1Tx, uart3_tx: &'static Uart3Tx) {
+async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart3_tx: &'static Uart3Tx) {
     let mut buf = [0u8; 64];
     loop {
         let n = {
@@ -314,27 +336,25 @@ async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart1_tx: &'stat
             match IoRead::read(&mut *guard, &mut buf).await {
                 Ok(n) => n,
                 Err(_) => {
+                    info!("uart1 read error");
                     Timer::after_millis(1).await;
                     continue;
                 }
             }
         };
-
+        debug_after_read_marker(10);
         if n == 0 {
             Timer::after_millis(1).await;
             continue;
         }
 
-        // Feed shell (best-effort, drop if full)
-        for &b in &buf[..n] {
-            let _ = UART1_SHELL_CH.try_send(b);
-        }
+        // // Feed shell (best-effort, drop if full)
+        // for &b in &buf[..n] {
+        //     let _ = UART1_SHELL_CH.try_send(b);
+        // }
 
-        // Echo back to UART1
-        {
-            let mut guard = uart1_tx.lock().await;
-            let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
-        }
+        // Echo back to UART1 through single-writer queue.
+        uart1_enqueue_bytes(&buf[..n]).await;
 
         // Forward to UART3
         let mut guard = uart3_tx.lock().await;
@@ -344,7 +364,28 @@ async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart1_tx: &'stat
 }
 
 #[embassy_executor::task]
-async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx, uart1_tx: &'static Uart1Tx) {
+async fn uart1_tx_worker(uart1_tx: &'static Uart1Tx) {
+    let mut out = [0u8; 64];
+    loop {
+        out[0] = UART1_TX_CH.receive().await;
+        let mut n = 1;
+        while n < out.len() {
+            match UART1_TX_CH.try_receive() {
+                Ok(b) => {
+                    out[n] = b;
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut guard = uart1_tx.lock().await;
+        let _ = IoWrite::write(&mut *guard, &out[..n]).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx) {
     let mut buf = [0u8; 64];
     loop {
         let n = {
@@ -363,8 +404,9 @@ async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx, uart1_tx: &'stat
             continue;
         }
 
-        let mut guard = uart1_tx.lock().await;
-        let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
-        drop(guard);
+        info!("uart3 received {} bytes: {}", n, &buf);
+
+        // Forward to UART1 through single-writer queue.
+        uart1_enqueue_bytes(&buf[..n]).await;
     }
 }

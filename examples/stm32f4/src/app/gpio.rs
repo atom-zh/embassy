@@ -5,6 +5,7 @@ use embassy_time::Timer;
 
 const HIGH_MILLIS: u64 = 200;
 const LOW_MILLIS: u64 = 200;
+const PD15_KEEPALIVE_MILLIS: u64 = 1000;
 
 pub struct UsartPins {
     pub uart1: Peri<'static, peripherals::USART1>,
@@ -20,6 +21,7 @@ pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins 
     // Fixed pin: PE9
     let embassy_stm32::Peripherals {
         PE9,
+        PD15,
         USART1,
         PA10,
         PA9,
@@ -29,8 +31,16 @@ pub fn gpio_init(spawner: &Spawner, p: embassy_stm32::Peripherals) -> UsartPins 
         ..
     } = p;
 
-    let pin = Output::new(PE9, Level::High, Speed::Low);
-    spawner.spawn(blink_1hz(pin).unwrap());
+    let pe9 = Output::new(PE9, Level::High, Speed::Low);
+    spawner.spawn(blink_1hz(pe9).unwrap());
+
+    // Fixed pin: PD15, output mode, default high.
+    // Keep ownership in a task so lifecycle matches PE9 task style.
+    let mut pd15 = Output::new(PD15, Level::High, Speed::Low);
+    // spawner.spawn(hold_high(pd15).unwrap());
+    pd15.set_high();
+    Timer::after_millis(1000);
+    pd15.set_low();
 
     UsartPins {
         uart1: USART1,
