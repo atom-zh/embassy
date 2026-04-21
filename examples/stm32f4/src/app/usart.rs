@@ -140,7 +140,7 @@ pub fn init(
     uart1_cfg.eager_reads = Some(1);
     let uart1 = Uart::new(uart1, uart1_rx, uart1_tx, uart1_tx_dma, uart1_rx_dma, Irqs, uart1_cfg).unwrap();
     let (uart1_tx, uart1_rx) = uart1.split();
-    let (uart1_tx, uart1_rx) = init_uart1_mutexes(uart1_tx, uart1_rx);
+    let (uart1_tx, _uart1_rx) = init_uart1_mutexes(uart1_tx, uart1_rx);
 
     // UART3 (passthrough)
     let mut uart3_cfg = Config::default();
@@ -159,10 +159,15 @@ pub fn init(
     // spawner.spawn(usart_task_b(uart1_tx, start).unwrap());
     // spawner.spawn(shell_task(uart1_tx, uart1_shell_rx, start).unwrap());
 
-    // Passthrough tasks (independent tasks)
+    // PPP over UART3 + TCP client tasks.
+    super::tcp::init(spawner, uart3_tx, uart3_rx);
+
+    // Keep UART1 writer task available for local console output if needed.
     spawner.spawn(uart1_tx_worker(uart1_tx).unwrap());
-    spawner.spawn(uart1_to_uart3_passthrough(uart1_rx, uart3_tx).unwrap());
-    spawner.spawn(uart3_to_uart1_passthrough(uart3_rx).unwrap());
+
+    // UART3 passthrough tasks must stay disabled while PPP owns UART3.
+    // spawner.spawn(uart1_to_uart3_passthrough(uart1_rx, uart3_tx).unwrap());
+    // spawner.spawn(uart3_to_uart1_passthrough(uart3_rx).unwrap());
 }
 
 #[embassy_executor::task]
