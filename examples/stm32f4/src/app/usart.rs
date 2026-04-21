@@ -4,31 +4,34 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config};
+use embassy_stm32::dma;
+use embassy_stm32::mode::Async;
+use embassy_stm32::usart::{self, Config, Uart, UartRx, UartTx};
 use embassy_stm32::{bind_interrupts, peripherals, Peri};
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
-use embedded_io_async::{ErrorType, Read as IoRead, Write as IoWrite};
+use embedded_io_async::{ErrorType, Read as IoRead};
 use heapless::String;
 use static_cell::StaticCell;
 
-bind_interrupts!(pub struct Uart1Irqs {
-    USART1 => BufferedInterruptHandler<peripherals::USART1>;
-});
-
-bind_interrupts!(pub struct Uart3Irqs {
-    USART3 => BufferedInterruptHandler<peripherals::USART3>;
+bind_interrupts!(pub struct Irqs {
+    USART1 => usart::InterruptHandler<peripherals::USART1>;
+    USART3 => usart::InterruptHandler<peripherals::USART3>;
+    DMA2_STREAM2 => dma::InterruptHandler<peripherals::DMA2_CH2>;
+    DMA2_STREAM7 => dma::InterruptHandler<peripherals::DMA2_CH7>;
+    DMA1_STREAM1 => dma::InterruptHandler<peripherals::DMA1_CH1>;
+    DMA1_STREAM3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
 });
 
 // UART1 is the existing console UART (USART1, PA9/PA10)
-pub type Uart1Tx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
-pub type Uart1Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
+pub type Uart1Tx = Mutex<NoopRawMutex, UartTx<'static, Async>>;
+pub type Uart1Rx = Mutex<NoopRawMutex, UartRx<'static, Async>>;
 
 // UART3 is the new high-speed passthrough UART (USART3, PD8/PD9)
-pub type Uart3Tx = Mutex<NoopRawMutex, BufferedUartTx<'static>>;
-pub type Uart3Rx = Mutex<NoopRawMutex, BufferedUartRx<'static>>;
+pub type Uart3Tx = Mutex<NoopRawMutex, UartTx<'static, Async>>;
+pub type Uart3Rx = Mutex<NoopRawMutex, UartRx<'static, Async>>;
 
 const UART1_BAUDRATE: u32 = 921_600;
 const UART3_BAUDRATE: u32 = 921_600;
@@ -76,12 +79,6 @@ static UART1_SHELL_RX: StaticCell<Uart1ShellRx> = StaticCell::new();
 static UART1_SHELL_CH: Channel<ThreadModeRawMutex, u8, 256> = Channel::new();
 static UART1_TX_CH: Channel<ThreadModeRawMutex, u8, 512> = Channel::new();
 
-static TX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
-static RX_BUF_CELL: StaticCell<[u8; 256]> = StaticCell::new();
-
-static UART3_TX_BUF_CELL: StaticCell<[u8; 512]> = StaticCell::new();
-static UART3_RX_BUF_CELL: StaticCell<[u8; 512]> = StaticCell::new();
-
 #[allow(dead_code)]
 static TASK_A_COUNT: AtomicU32 = AtomicU32::new(0);
 #[allow(dead_code)]
@@ -102,19 +99,19 @@ fn debug_after_read_marker(n: usize) {
     core::hint::black_box(n);
 }
 
-async fn uart1_enqueue_bytes(bytes: &[u8]) {
+fn uart1_try_enqueue_bytes(bytes: &[u8]) {
     for &b in bytes {
-        UART1_TX_CH.send(b).await;
+        let _ = UART1_TX_CH.try_send(b);
     }
 }
 
-fn init_uart1_mutexes(tx: BufferedUartTx<'static>, rx: BufferedUartRx<'static>) -> (&'static Uart1Tx, &'static Uart1Rx) {
+fn init_uart1_mutexes(tx: UartTx<'static, Async>, rx: UartRx<'static, Async>) -> (&'static Uart1Tx, &'static Uart1Rx) {
     let uart1_tx = UART1_TX.init(Mutex::new(tx));
     let uart1_rx = UART1_RX.init(Mutex::new(rx));
     (uart1_tx, uart1_rx)
 }
 
-fn init_uart3_mutexes(tx: BufferedUartTx<'static>, rx: BufferedUartRx<'static>) -> (&'static Uart3Tx, &'static Uart3Rx) {
+fn init_uart3_mutexes(tx: UartTx<'static, Async>, rx: UartRx<'static, Async>) -> (&'static Uart3Tx, &'static Uart3Rx) {
     let uart3_tx = UART3_TX.init(Mutex::new(tx));
     let uart3_rx = UART3_RX.init(Mutex::new(rx));
     (uart3_tx, uart3_rx)
@@ -126,20 +123,22 @@ pub fn init(
     uart1: Peri<'static, peripherals::USART1>,
     uart1_rx: Peri<'static, peripherals::PA10>,
     uart1_tx: Peri<'static, peripherals::PA9>,
+    uart1_tx_dma: Peri<'static, peripherals::DMA2_CH7>,
+    uart1_rx_dma: Peri<'static, peripherals::DMA2_CH2>,
     uart3: Peri<'static, peripherals::USART3>,
     uart3_rx: Peri<'static, peripherals::PD9>,
     uart3_tx: Peri<'static, peripherals::PD8>,
+    uart3_tx_dma: Peri<'static, peripherals::DMA1_CH3>,
+    uart3_rx_dma: Peri<'static, peripherals::DMA1_CH1>,
     start: Instant,
 ) {
     // UART1 (console)
     let mut uart1_cfg = Config::default();
     // Lower console baudrate to avoid RX overrun during heavy load/debug sessions.
     uart1_cfg.baudrate = UART1_BAUDRATE;
-    // Wake reader as soon as data arrives (instead of waiting for half buffer/idle).
+    // Wake reader as soon as data arrives.
     uart1_cfg.eager_reads = Some(1);
-    let uart1_tx_buf = TX_BUF_CELL.init([0u8; 256]);
-    let uart1_rx_buf = RX_BUF_CELL.init([0u8; 256]);
-    let uart1 = BufferedUart::new(uart1, uart1_rx, uart1_tx, uart1_tx_buf, uart1_rx_buf, Uart1Irqs, uart1_cfg).unwrap();
+    let uart1 = Uart::new(uart1, uart1_rx, uart1_tx, uart1_tx_dma, uart1_rx_dma, Irqs, uart1_cfg).unwrap();
     let (uart1_tx, uart1_rx) = uart1.split();
     let (uart1_tx, uart1_rx) = init_uart1_mutexes(uart1_tx, uart1_rx);
 
@@ -147,9 +146,7 @@ pub fn init(
     let mut uart3_cfg = Config::default();
     uart3_cfg.baudrate = UART3_BAUDRATE;
     uart3_cfg.eager_reads = Some(1);
-    let uart3_tx_buf = UART3_TX_BUF_CELL.init([0u8; 512]);
-    let uart3_rx_buf = UART3_RX_BUF_CELL.init([0u8; 512]);
-    let uart3 = BufferedUart::new(uart3, uart3_rx, uart3_tx, uart3_tx_buf, uart3_rx_buf, Uart3Irqs, uart3_cfg).unwrap();
+    let uart3 = Uart::new(uart3, uart3_rx, uart3_tx, uart3_tx_dma, uart3_rx_dma, Irqs, uart3_cfg).unwrap();
     let (uart3_tx, uart3_rx) = uart3.split();
     let (uart3_tx, uart3_rx) = init_uart3_mutexes(uart3_tx, uart3_rx);
 
@@ -172,7 +169,7 @@ pub fn init(
 async fn usart_task_a(usart_tx: &'static Uart1Tx, start: Instant) {
     loop {
         let mut guard = usart_tx.lock().await;
-        unwrap!(IoWrite::write(&mut *guard, b"[Task A] Hello from task A!\r\n").await);
+        unwrap!(guard.write(b"[Task A] Hello from task A!\r\n").await);
         drop(guard);
         let uptime = (Instant::now() - start).as_secs() as u32;
         TASK_A_LAST_SECS.store(uptime, Ordering::Relaxed);
@@ -185,7 +182,7 @@ async fn usart_task_a(usart_tx: &'static Uart1Tx, start: Instant) {
 async fn usart_task_b(usart_tx: &'static Uart1Tx, start: Instant) {
     loop {
         let mut guard = usart_tx.lock().await;
-        unwrap!(IoWrite::write(&mut *guard, b"[Task B] Hello from task B!\r\n").await);
+        unwrap!(guard.write(b"[Task B] Hello from task B!\r\n").await);
         drop(guard);
         let uptime = (Instant::now() - start).as_secs() as u32;
         TASK_B_LAST_SECS.store(uptime, Ordering::Relaxed);
@@ -232,7 +229,7 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
                     }
                     last_was_cr = b == b'\r';
 
-                    let _ = IoWrite::write(&mut *guard, b"\r\n").await;
+                    let _ = guard.write(b"\r\n").await;
 
                     // Newline terminates the command line.
                     if line_len == 0 {
@@ -243,16 +240,14 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
                         let cmd = cmd.trim();
 
                         if cmd.eq_ignore_ascii_case("help") {
-                            let _ = IoWrite::write(
-                                &mut *guard,
-                                b"Commands:\r\n  status - show uptime\r\n  ps     - task status\r\n  help   - this message\r\n",
-                            )
-                            .await;
+                            let _ = guard
+                                .write(b"Commands:\r\n  status - show uptime\r\n  ps     - task status\r\n  help   - this message\r\n")
+                                .await;
                         } else if cmd.eq_ignore_ascii_case("status") {
                             let uptime = (Instant::now() - start).as_secs();
                             let mut s: String<64> = String::new();
                             let _ = FmtWrite::write_fmt(&mut s, core::format_args!("Uptime: {} s\r\n", uptime));
-                            let _ = IoWrite::write(&mut *guard, s.as_bytes()).await;
+                            let _ = guard.write(s.as_bytes()).await;
                         } else if cmd.eq_ignore_ascii_case("ps") {
                             let now = (Instant::now() - start).as_secs() as u32;
                             let a_count = TASK_A_COUNT.load(Ordering::Relaxed);
@@ -288,9 +283,9 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
                                     now.saturating_sub(s_last)
                                 ),
                             );
-                            let _ = IoWrite::write(&mut *guard, out.as_bytes()).await;
+                            let _ = guard.write(out.as_bytes()).await;
                         } else if !cmd.is_empty() {
-                            let _ = IoWrite::write(&mut *guard, b"Unknown command. Type 'help'\r\n").await;
+                            let _ = guard.write(b"Unknown command. Type 'help'\r\n").await;
                         }
                     }
 
@@ -307,7 +302,7 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
                     if line_len > 0 {
                         line_len -= 1;
                         // Erase the last character on the terminal.
-                        let _ = IoWrite::write(&mut *guard, b"\x08 \x08").await;
+                        let _ = guard.write(b"\x08 \x08").await;
                     }
                 }
 
@@ -315,7 +310,7 @@ pub async fn shell_task(usart_tx: &'static Uart1Tx, usart_rx: &'static Uart1Shel
                     if line_len < line_buf.len() {
                         line_buf[line_len] = b;
                         line_len += 1;
-                        let _ = IoWrite::write(&mut *guard, &[b]).await;
+                        let _ = guard.write(&[b]).await;
                     } else {
                         // Overflow: drop the current line to avoid confusing partial commands.
                         line_len = 0;
@@ -333,7 +328,7 @@ async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart3_tx: &'stat
     loop {
         let n = {
             let mut guard = uart1_rx.lock().await;
-            match IoRead::read(&mut *guard, &mut buf).await {
+            match guard.read_until_idle(&mut buf).await {
                 Ok(n) => n,
                 Err(_) => {
                     info!("uart1 read error");
@@ -353,12 +348,12 @@ async fn uart1_to_uart3_passthrough(uart1_rx: &'static Uart1Rx, uart3_tx: &'stat
         //     let _ = UART1_SHELL_CH.try_send(b);
         // }
 
-        // Echo back to UART1 through single-writer queue.
-        uart1_enqueue_bytes(&buf[..n]).await;
+        // Echo back to UART1 through single-writer queue (non-blocking to keep RX serviced).
+        uart1_try_enqueue_bytes(&buf[..n]);
 
         // Forward to UART3
         let mut guard = uart3_tx.lock().await;
-        let _ = IoWrite::write(&mut *guard, &buf[..n]).await;
+        let _ = guard.write(&buf[..n]).await;
         drop(guard);
     }
 }
@@ -380,17 +375,20 @@ async fn uart1_tx_worker(uart1_tx: &'static Uart1Tx) {
         }
 
         let mut guard = uart1_tx.lock().await;
-        let _ = IoWrite::write(&mut *guard, &out[..n]).await;
+        let _ = guard.write(&out[..n]).await;
     }
 }
 
 #[embassy_executor::task]
 async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx) {
     let mut buf = [0u8; 64];
+    let mut line_buf = [0u8; 256];
+    let mut line_len: usize = 0;
+
     loop {
         let n = {
             let mut guard = uart3_rx.lock().await;
-            match IoRead::read(&mut *guard, &mut buf).await {
+            match guard.read_until_idle(&mut buf).await {
                 Ok(n) => n,
                 Err(_) => {
                     Timer::after_millis(1).await;
@@ -404,9 +402,35 @@ async fn uart3_to_uart1_passthrough(uart3_rx: &'static Uart3Rx) {
             continue;
         }
 
-        info!("uart3 received {} bytes: {}", n, &buf);
+        for &b in &buf[..n] {
+            match b {
+                b'\r' => {
+                    // Bare CR is ignored as a separator.
+                }
+                b'\n' => {
+                    // Handle LF and CRLF as line terminator.
+                    if line_len > 0 {
+                        if let Ok(s) = core::str::from_utf8(&line_buf[..line_len]) {
+                            info!("uart3 line: {}", s);
+                        } else {
+                            info!("uart3 line: <non-utf8, {} bytes>", line_len);
+                        }
+                        line_len = 0;
+                    }
+                }
+                _ => {
+                    if line_len < line_buf.len() {
+                        line_buf[line_len] = b;
+                        line_len += 1;
+                    } else {
+                        info!("uart3 line too long, dropping");
+                        line_len = 0;
+                    }
+                }
+            }
+        }
 
-        // Forward to UART1 through single-writer queue.
-        uart1_enqueue_bytes(&buf[..n]).await;
+        // Forward to UART1 through single-writer queue (non-blocking to keep RX serviced).
+        uart1_try_enqueue_bytes(&buf[..n]);
     }
 }
