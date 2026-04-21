@@ -31,9 +31,13 @@ async fn main(spawner: Spawner) {
         usart_pins.uart1,
         usart_pins.uart1_rx,
         usart_pins.uart1_tx,
+        usart_pins.uart1_tx_dma,
+        usart_pins.uart1_rx_dma,
         usart_pins.uart3,
         usart_pins.uart3_rx,
         usart_pins.uart3_tx,
+        usart_pins.uart3_tx_dma,
+        usart_pins.uart3_rx_dma,
         start,
     );
 
