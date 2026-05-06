@@ -134,6 +134,19 @@ fn main() {
         cfgs.enable("backup_sram")
     }
 
+    // SDMMC v3 + `time` feature: enables UHS-I 1.8V signalling support.
+    // Used in lieu of `cfg(all(sdmmc_v3, feature = "time"))` to keep the
+    // SDMMC driver readable.
+    cfgs.declare("sdmmc_uhs");
+    let has_sdmmc_v3 = METADATA
+        .peripherals
+        .iter()
+        .filter_map(|p| p.registers.as_ref())
+        .any(|r| r.kind == "sdmmc" && r.version == "v3");
+    if has_sdmmc_v3 && env::var("CARGO_FEATURE_TIME").is_ok() {
+        cfgs.enable("sdmmc_uhs");
+    }
+
     // compile a map of peripherals with registers
     let peripheral_map: HashMap<&str, (&Peripheral, &PeripheralRegisters)> = METADATA
         .peripherals
@@ -1315,6 +1328,7 @@ fn main() {
         (("lptim", "CH2"), quote!(crate::lptim::Channel2Pin)),
         (("lptim", "OUT"), quote!(crate::lptim::OutputPin)),
         (("sdmmc", "CK"), quote!(crate::sdmmc::CkPin)),
+        (("sdmmc", "CKIN"), quote!(crate::sdmmc::CkinPin)),
         (("sdmmc", "CMD"), quote!(crate::sdmmc::CmdPin)),
         (("sdmmc", "D0"), quote!(crate::sdmmc::D0Pin)),
         (("sdmmc", "D1"), quote!(crate::sdmmc::D1Pin)),
@@ -1868,6 +1882,13 @@ fn main() {
         signals.insert(("adc", "ADC4"), quote!(crate::adc::RxDma));
     }
 
+    // JPEG HAL is currently N6-only; only emit dma_trait impls there.
+    // ST naming: jpeg_rx_dma = mem→peri (input), jpeg_tx_dma = peri→mem (output).
+    if chip_name.starts_with("stm32n6") {
+        signals.insert(("jpeg", "RX"), quote!(crate::jpeg::DmaIn));
+        signals.insert(("jpeg", "TX"), quote!(crate::jpeg::DmaOut));
+    }
+
     if chip_name.starts_with("stm32g4") {
         let line_number = chip_name.chars().skip(8).next().unwrap();
         if line_number == '3' || line_number == '4' {
@@ -1876,7 +1897,7 @@ fn main() {
     }
 
     for (p, regs) in &peripheral_list {
-        if regs.kind == "adc" && regs.version == "f3v3" {
+        if regs.kind == "adc" && (regs.version == "f3v3" || regs.version == "wb1") {
             continue;
         }
 

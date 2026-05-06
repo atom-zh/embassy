@@ -9,6 +9,8 @@
 
 use super::{ClockError, Clocks, PoweredClock, WakeGuard};
 use crate::clocks::VddLevel;
+#[cfg(feature = "mcxa5xx")]
+use crate::pac::mrcc::FlexspiClkselMux;
 use crate::pac::mrcc::{
     AdcClkselMux, ClkdivHalt, ClkdivReset, ClkdivUnstab, CtimerClkselMux, FclkClkselMux, Lpi2cClkselMux,
     LpspiClkselMux, LpuartClkselMux, OstimerClkselMux,
@@ -202,6 +204,18 @@ impl SPConfHelper for Clk1MConfig {
             freq: 1_000_000,
             wake_guard: None,
         })
+    }
+}
+
+/// Placeholder configuration for the DAC peripheral.
+///
+/// The DAC HAL driver is not yet implemented, but the PAC metadata
+/// declares the gate config type, so we provide a stub here. Replace
+/// with the real implementation when the DAC driver is added.
+pub struct DacConfig;
+impl SPConfHelper for DacConfig {
+    fn pre_enable_config(&self, _clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+        Ok(PreEnableParts::empty())
     }
 }
 
@@ -594,6 +608,65 @@ impl SPConfHelper for LpspiConfig {
 }
 
 //
+// FlexSPI
+//
+
+/// Selectable clocks for `FlexSPI` peripherals.
+#[cfg(feature = "mcxa5xx")]
+#[derive(Debug, Clone, Copy)]
+pub enum FlexspiClockSel {
+    /// Gated FRO_HF / FIRC clock.
+    FroHf,
+    /// PLL1 clock after its divider.
+    Pll1ClkDiv,
+}
+
+/// Which instance of the `FlexSPI` peripheral is this?
+#[cfg(feature = "mcxa5xx")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlexspiInstance {
+    /// Instance 0.
+    Flexspi0,
+}
+
+/// Top level configuration for `FlexSPI` instances.
+#[cfg(feature = "mcxa5xx")]
+pub struct FlexspiConfig {
+    /// Power state required for this peripheral.
+    pub power: PoweredClock,
+    /// Clock source.
+    pub source: FlexspiClockSel,
+    /// Clock divisor.
+    pub div: Div4,
+    /// Which instance is this?
+    pub(crate) instance: FlexspiInstance,
+}
+
+#[cfg(feature = "mcxa5xx")]
+impl SPConfHelper for FlexspiConfig {
+    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            FlexspiInstance::Flexspi0 => (mrcc0.mrcc_flexspi0_clkdiv(), mrcc0.mrcc_flexspi0_clksel()),
+        };
+
+        let (freq, variant) = match self.source {
+            FlexspiClockSel::FroHf => (
+                clocks.ensure_fro_hf_active(&self.power)?,
+                FlexspiClkselMux::I1ClkrootFircGated,
+            ),
+            FlexspiClockSel::Pll1ClkDiv => (
+                clocks.ensure_pll1_clk_div_active(&self.power)?,
+                FlexspiClkselMux::I6ClkrootSpll,
+            ),
+        };
+
+        apply_div4!(self, clksel, clkdiv, variant, freq)
+    }
+}
+
+//
 // I3C
 //
 
@@ -750,6 +823,9 @@ pub enum Lpi2cInstance {
     Lpi2c2,
     /// Instance 3
     Lpi2c3,
+    #[cfg(feature = "mcxa5xx")]
+    /// Instance 4
+    Lpi2c4,
 }
 
 /// Top level configuration for `Lpi2c` instances.
@@ -775,6 +851,8 @@ impl SPConfHelper for Lpi2cConfig {
             Lpi2cInstance::Lpi2c1 => (mrcc0.mrcc_lpi2c1_clkdiv(), mrcc0.mrcc_lpi2c1_clksel()),
             Lpi2cInstance::Lpi2c2 => (mrcc0.mrcc_lpi2c2_clkdiv(), mrcc0.mrcc_lpi2c2_clksel()),
             Lpi2cInstance::Lpi2c3 => (mrcc0.mrcc_lpi2c3_clkdiv(), mrcc0.mrcc_lpi2c3_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            Lpi2cInstance::Lpi2c4 => (mrcc0.mrcc_lpi2c4_clkdiv(), mrcc0.mrcc_lpi2c4_clksel()),
         };
 
         let (freq, variant) = match self.source {

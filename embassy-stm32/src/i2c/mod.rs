@@ -164,6 +164,26 @@ impl<'d> I2c<'d, Async, Master> {
             config,
         )
     }
+
+    /// Create a new I2C driver.
+    pub fn new_no_dma<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        scl: Peri<'d, if_afio!(impl SclPin<T, A>)>,
+        sda: Peri<'d, if_afio!(impl SdaPin<T, A>)>,
+        _irq: impl interrupt::typelevel::Binding<T::EventInterrupt, EventInterruptHandler<T>>
+        + interrupt::typelevel::Binding<T::ErrorInterrupt, ErrorInterruptHandler<T>>
+        + 'd,
+        config: Config,
+    ) -> Self {
+        Self::new_inner(
+            peri,
+            new_pin!(scl, config.scl_af()),
+            new_pin!(sda, config.sda_af()),
+            None,
+            None,
+            config,
+        )
+    }
 }
 
 impl<'d> I2c<'d, Blocking, Master> {

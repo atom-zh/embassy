@@ -9,7 +9,7 @@ use convert_case::ccase;
 use indexmap::IndexMap;
 use nxp_pac::metadata::METADATA;
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use regex::Regex;
 
 mod build_common;
@@ -44,7 +44,9 @@ fn main() {
     let generated = [
         generate_peripherals_call(),
         generate_interrupt_mod_call(),
+        generate_cc_gates(),
         generate_dma_requests_enum(),
+        generate_instance_calls(),
         generate_gpio_pin_impls(),
         generate_adc_pin_impls(),
         generate_clkout_impls(),
@@ -53,6 +55,7 @@ fn main() {
         generate_spi_pin_impls(),
         generate_ctimer_pin_impls(),
         generate_lpuart_pin_impls(),
+        generate_flexspi_pin_impls(),
     ];
 
     let out_dir = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -151,6 +154,36 @@ fn generate_interrupt_mod_call() -> TokenStream {
     }
 }
 
+fn generate_cc_gates() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    for peripheral in METADATA.peripherals {
+        let Some(gate) = peripheral.gate.as_ref() else {
+            continue;
+        };
+
+        let peripheral_name = format_ident!("{}", peripheral.name);
+        let enable = format_ident!("{}", gate.enable);
+        let reset = gate.reset.map(|reset| format_ident!("{reset}"));
+        let config = gate
+            .config
+            .map(|config| format_ident!("{config}"))
+            .unwrap_or_else(|| format_ident!("NoConfig"));
+        let bit = format_ident!("{}", peripheral.name.to_lowercase());
+
+        match reset {
+            Some(reset) => generated.extend(quote! {
+                crate::impl_cc_gate!(#peripheral_name, #enable, #reset, #bit, #config);
+            }),
+            None => generated.extend(quote! {
+                crate::impl_cc_gate!(#peripheral_name, #enable, #bit, #config);
+            }),
+        }
+    }
+
+    generated
+}
+
 fn pin_feature_gate(pin_name: &str) -> TokenStream {
     let pin = METADATA
         .pins
@@ -160,6 +193,46 @@ fn pin_feature_gate(pin_name: &str) -> TokenStream {
     pin.feature
         .as_ref()
         .map_or(TokenStream::default(), |feature| quote! { #[cfg(feature = #feature)] })
+}
+
+fn generate_instance_calls() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    const REQUIRES_INSTANCE: &[&str] = &[
+        "adc", "crc", "gpio", "trng", "wwdt", "ctimer", "lpi2c", "i3c", "lpuart", "lpspi", "flexspi",
+    ];
+
+    let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
+
+    for peripheral in METADATA.peripherals {
+        if peripheral.driver_name.is_empty() {
+            // Only use peripherals that have a driver
+            continue;
+        }
+
+        let Some(captures) = peripheral_regex.captures(peripheral.name) else {
+            panic!("Weird peripheral name: {}", peripheral.name);
+        };
+
+        let peripheral_name = captures.get(1).unwrap().as_str().to_lowercase();
+        let peripheral_number = captures.get(2).map(|m| m.as_str().parse::<u32>().unwrap());
+
+        if REQUIRES_INSTANCE.contains(&peripheral_name.as_str()) {
+            let arg = if let Some(peripheral_number) = peripheral_number {
+                proc_macro2::Literal::u32_unsuffixed(peripheral_number).into_token_stream()
+            } else {
+                TokenStream::new()
+            };
+
+            let macro_ident = format_ident!("impl_{peripheral_name}_instance");
+
+            generated.extend(quote! {
+                crate::#macro_ident!(#arg);
+            });
+        }
+    }
+
+    generated
 }
 
 fn generate_gpio_pin_impls() -> TokenStream {
@@ -182,7 +255,7 @@ fn generate_gpio_pin_impls() -> TokenStream {
 
             generated.extend(quote! {
                 #feature_gate
-                impl_gpio_pin!(#pin, #gpio_num, #pin_num, #peripheral);
+                crate::impl_gpio_pin!(#pin, #gpio_num, #pin_num, #peripheral);
             });
         }
     }
@@ -208,7 +281,7 @@ fn generate_adc_pin_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_adc_pin!(#pin_name, #adc_name, #channel);
+                    crate::impl_adc_pin!(#pin_name, #adc_name, #channel);
                 });
             }
         }
@@ -233,7 +306,7 @@ fn generate_clkout_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_clkout_pin!(#pin_name, #mux);
+                    crate::impl_clkout_pin!(#pin_name, #mux);
                 });
             }
         }
@@ -257,7 +330,7 @@ fn generate_lpi2c_pin_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_lpi2c_pin!(#pin_name, #lpi2c_name, #mux, #signal_pin);
+                    crate::impl_lpi2c_pin!(#pin_name, #lpi2c_name, #mux, #signal_pin);
                 });
             }
         }
@@ -281,7 +354,7 @@ fn generate_i3c_pin_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_i3c_pin!(#pin_name, #i3c_name, #mux, #signal_pin);
+                    crate::impl_i3c_pin!(#pin_name, #i3c_name, #mux, #signal_pin);
                 });
             }
         }
@@ -305,7 +378,34 @@ fn generate_spi_pin_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_spi_pin!(#pin_name, #spi_name, #mux, #signal_pin);
+                    crate::impl_spi_pin!(#pin_name, #spi_name, #mux, #signal_pin);
+                });
+            }
+        }
+    }
+
+    generated
+}
+
+fn generate_flexspi_pin_impls() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    let flexspi_regex = Regex::new(r"^FLEXSPI\d+").unwrap();
+    for flexspi in METADATA.peripherals.iter().filter(|p| flexspi_regex.is_match(p.name)) {
+        let flexspi_name = format_ident!("{}", flexspi.name);
+
+        let mut emitted_pins = std::collections::HashSet::new();
+        for signal in flexspi.signals {
+            for pin in signal.pins {
+                if !emitted_pins.insert(pin.pin) {
+                    continue;
+                }
+                let pin_name = format_ident!("{}", pin.pin);
+                let feature_gate = pin_feature_gate(pin.pin);
+
+                generated.extend(quote! {
+                    #feature_gate
+                    crate::impl_flexspi_pin!(#pin_name, #flexspi_name);
                 });
             }
         }
@@ -346,7 +446,7 @@ fn generate_ctimer_pin_impls() -> TokenStream {
                     let ctimer_channel = format_ident!("{}_CH{}", ctimer_name, match_index);
                     generated.extend(quote! {
                         #feature_gate
-                        impl_ctimer_match!(#ctimer_name, #ctimer_channel, #pin_name);
+                        crate::impl_ctimer_match!(#ctimer_name, #ctimer_channel, #pin_name);
                     });
                 }
             } else {
@@ -358,14 +458,14 @@ fn generate_ctimer_pin_impls() -> TokenStream {
             let feature_gate = pin_feature_gate(&pin_name.to_string());
             generated.extend(quote! {
                 #feature_gate
-                impl_ctimer_input_pin!(#pin_name, #ctimer_name, #mux);
+                crate::impl_ctimer_input_pin!(#pin_name, #ctimer_name, #mux);
             });
         }
         for (pin_name, mux) in mat_pins {
             let feature_gate = pin_feature_gate(&pin_name.to_string());
             generated.extend(quote! {
                 #feature_gate
-                impl_ctimer_output_pin!(#pin_name, #ctimer_name, #mux);
+                crate::impl_ctimer_output_pin!(#pin_name, #ctimer_name, #mux);
             });
         }
     }
@@ -388,7 +488,7 @@ fn generate_lpuart_pin_impls() -> TokenStream {
 
                 generated.extend(quote! {
                     #feature_gate
-                    impl_lpuart_pin!(#lpuart_name, #pin_name, #mux, #signal_name);
+                    crate::impl_lpuart_pin!(#lpuart_name, #pin_name, #mux, #signal_name);
                 });
             }
         }
